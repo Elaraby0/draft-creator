@@ -1,0 +1,157 @@
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Gmail Drafts')
+    .addItem('1. Authorize Gmail first', 'authorizeGmail')
+    .addSeparator()
+    .addItem('2. Create next drafts', 'createNextDrafts')
+    .addToUi();
+}
+
+function authorizeGmail() {
+  // Triggers Google's permission screen if Gmail has not been authorized.
+  GmailApp.getAliases();
+
+  SpreadsheetApp.getUi().alert(
+    'Gmail authorization is complete. You can now select “Create next drafts.”'
+  );
+}
+
+function createNextDrafts() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName('Gmail Draft Import');
+  const ui = SpreadsheetApp.getUi();
+
+  if (!sheet) {
+    throw new Error('Sheet "Gmail Draft Import" was not found.');
+  }
+
+  const response = ui.prompt(
+    'Create Gmail drafts',
+    'How many new drafts do you want to create now? Example: 25',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const requested = Number(response.getResponseText().trim());
+
+  if (!Number.isInteger(requested) || requested < 1) {
+    ui.alert('Please enter a whole number greater than zero.');
+    return;
+  }
+
+  // Prevents two runs from creating duplicate drafts at the same time.
+  const lock = LockService.getDocumentLock();
+
+  if (!lock.tryLock(5000)) {
+    ui.alert('Another draft-creation process is running. Please try again shortly.');
+    return;
+  }
+
+  try {
+    // Adds these tracking columns if they do not exist already.
+    const draftStatusCol = ensureColumn(sheet, 'Draft status');
+    const draftIdCol = ensureColumn(sheet, 'Draft ID');
+
+    const values = sheet.getDataRange().getValues();
+    const headers = values[0].map(String);
+    const col = {};
+
+    headers.forEach((header, index) => {
+      col[header.trim()] = index;
+    });
+
+    ['To', 'Subject', 'Body'].forEach((header) => {
+      if (col[header] === undefined) {
+        throw new Error(`Required column missing: ${header}`);
+      }
+    });
+
+    let created = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    // Starts from the top every time, but skips records that already have a Draft ID.
+    for (let rowIndex = 1; rowIndex < values.length; rowIndex++) {
+      if (created >= requested) break;
+
+      const row = values[rowIndex];
+
+      const to = String(row[col['To']] || '').trim();
+      const subject = String(row[col['Subject']] || '').trim();
+      const body = String(row[col['Body']] || '');
+
+      const existingDraftId = String(row[draftIdCol - 1] || '').trim();
+
+      // A Draft ID means this physician already has a draft.
+      if (existingDraftId) {
+        skipped++;
+        continue;
+      }
+
+      // Skip incomplete records and mark the reason.
+      if (!to || !subject || !body) {
+        sheet.getRange(rowIndex + 1, draftStatusCol)
+          .setValue('Skipped: missing recipient, subject, or body');
+        skipped++;
+        continue;
+      }
+
+      try {
+        const draft = GmailApp.createDraft(to, subject, body);
+
+        // Marks the physician immediately after the draft is created.
+        sheet.getRange(rowIndex + 1, draftStatusCol)
+          .setValue(`Draft created: ${new Date().toLocaleString()}`);
+
+        sheet.getRange(rowIndex + 1, draftIdCol)
+          .setValue(draft.getId());
+
+        created++;
+      } catch (error) {
+        sheet.getRange(rowIndex + 1, draftStatusCol)
+          .setValue(`Error: ${error.message}`);
+
+        failed++;
+      }
+    }
+
+    SpreadsheetApp.flush();
+
+    ui.alert(
+      `Finished.\n\n` +
+      `New drafts created: ${created}\n` +
+      `Already drafted / skipped: ${skipped}\n` +
+      `Errors: ${failed}\n\n` +
+      `Rows with a Draft ID will not be drafted again.`
+    );
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function ensureColumn(sheet, headerName) {
+  const lastColumn = sheet.getLastColumn();
+
+  const headers = sheet
+    .getRange(1, 1, 1, lastColumn)
+    .getValues()[0]
+    .map(value => String(value).trim());
+
+  const existingIndex = headers.indexOf(headerName);
+
+  // Use the existing column if it already exists.
+  if (existingIndex !== -1) {
+    return existingIndex + 1;
+  }
+
+  // Add a new tracking column if it is missing.
+  const newColumn = lastColumn + 1;
+
+  sheet.getRange(1, newColumn)
+    .setValue(headerName)
+    .setFontWeight('bold')
+    .setBackground('#E2F0D9');
+
+  return newColumn;
+}
